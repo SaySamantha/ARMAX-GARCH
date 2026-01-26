@@ -205,14 +205,12 @@ if best_params_vol:
 else:
     print("\nERROR: No models converged.")
 
-# 1. Final Mean Model (ARIMAX)
 final_var = best_var.split('+')
 exog_train = train_data[final_var].iloc[:len(train_series)].values
 exog_test = test_data[final_var].iloc[:len(test_series)].values
 
 arimax_fit = ARIMA(train_series, order=(1,0,2), exog=exog_train).fit()
 
-# 2. Best GARCH Model (For parameter identification only)
 train_resids = arimax_fit.resid
 scaling_factor = 100.0 if np.abs(train_resids).mean() < 1e-3 else 1.0
 scaled_train_resids = train_resids * scaling_factor
