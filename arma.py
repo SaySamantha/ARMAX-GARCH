@@ -12,6 +12,8 @@ from armadata import ARMAVolumeDataset
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 from arch import arch_model
 import statsmodels.api as sm
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 #TO CHECK USING VIF LATER
 sing_exog_vars = ['log_return', 'relative_open', 'relative_high', 'relative_low', 'relative_close']
@@ -170,17 +172,13 @@ exog_val_best = val_data[best_exog_cols].iloc[:len(val_series)].values
 val_forecast_mean = final_arimax_for_diag.forecast(steps=len(val_series), exog=exog_val_best)
 val_resids = val_diff - val_forecast_mean
 
-#FIND BEST GARCH MODEL
+#FIND THE BEST GARCH MODEL
 arch_results = []
-best_aic_vol = np.inf
+best_rmse_vol = np.inf
 best_params_vol = None
 
 scaling_factor = 100.0 if np.abs(train_residuals).mean() < 1e-3 else 1.0
 scaled_train_residuals = train_residuals * scaling_factor
-
-arch_results = []
-best_aic_vol = np.inf
-best_params_vol = None
 
 for vol in vol_models:
     for p, q in vol_orders:
@@ -188,35 +186,44 @@ for vol in vol_models:
             try:
                 am = arch_model(scaled_train_residuals, vol=vol, p=p, q=q, dist=dist, mean="Zero")
                 res = am.fit(disp="off", show_warning=False)
-                current_aic = res.aic
-                arch_results.append({'model': f"{vol}({p},{q})", 'dist': dist, 'AIC': current_aic, 'Log-Likelihood': res.loglikelihood})
-                if current_aic < best_aic_vol:
-                    best_aic_vol = current_aic
-                    best_params_vol = {'type': vol, 'order': (p,q), 'dist': dist, 'scaling': scaling_factor}
+                
+                vol_preds = res.conditional_volatility
+                actual_vol = np.abs(scaled_train_residuals) 
+                v_rmse = np.sqrt(mean_squared_error(actual_vol, vol_preds))
+                
+                arch_results.append({
+                    'model': f"{vol}({p},{q})", 
+                    'dist': dist, 
+                    'RMSE': v_rmse / scaling_factor
+                })
+                
+                if v_rmse < best_rmse_vol:
+                    best_rmse_vol = v_rmse
+                    best_params_vol = {'type': vol, 'order': (p,q), 'dist': dist}
             except:
                 continue
 
-arch_summary_df = pd.DataFrame(arch_results).sort_values('AIC')
-
-print("\n[VOLATILITY MODEL SUMMARY]")
+arch_summary_df = pd.DataFrame(arch_results).sort_values('RMSE')
+print("\n[VOLATILITY MODEL SUMMARY (BY RMSE)]")
 print(arch_summary_df.head(10).to_string(index=False))
-if best_params_vol:
-    print(f"\nBEST: {best_params_vol['type']}({best_params_vol['order']}) with {best_params_vol['dist']} distribution.")
-else:
-    print("\nERROR: No models converged.")
 
+#FORECAST THE MEAN
 final_var = best_var.split('+')
 exog_train = train_data[final_var].iloc[:len(train_series)].values
 exog_test = test_data[final_var].iloc[:len(test_series)].values
 
 arimax_fit = ARIMA(train_series, order=(1,0,2), exog=exog_train).fit()
 
-train_resids = arimax_fit.resid
-scaling_factor = 100.0 if np.abs(train_resids).mean() < 1e-3 else 1.0
-scaled_train_resids = train_resids * scaling_factor
+test_dates = test_data.index[-len(test_diff):]
+test_indices = pd.RangeIndex(start=len(train_series), stop=len(train_series) + len(test_diff))
+exog_test_df = pd.DataFrame(exog_test, index=test_indices)
 
+updated_arimax = arimax_fit.append(pd.Series(test_diff, index=test_indices), exog=exog_test_df)
+mean_forecast = updated_arimax.predict(start=test_indices[0], end=test_indices[-1], exog=exog_test_df).values
+
+#FIT THE GARCH MODEL
 final_garch_model = arch_model(
-    scaled_train_resids, 
+    scaled_train_residuals, 
     vol=best_params_vol['type'], 
     p=best_params_vol['order'][0], 
     q=best_params_vol['order'][1], 
@@ -225,32 +232,87 @@ final_garch_model = arch_model(
 )
 garch_fitted = final_garch_model.fit(disp="off")
 
-test_dates = test_data.index[-len(test_diff):]
-test_indices = pd.RangeIndex(start=len(train_series), stop=len(train_series)+len(test_diff))
-exog_test_df = pd.DataFrame(exog_test, index=test_indices)
+#GENERATE USING SIMULATION
+forecast_horizon = len(test_diff)
+garch_forecast = garch_fitted.forecast(
+    horizon=forecast_horizon,
+    method='simulation',
+    simulations=100
+)
 
-updated_arimax = arimax_fit.append(pd.Series(test_diff, index=test_indices), exog=exog_test_df)
-mean_forecast_test = updated_arimax.predict(start=test_indices[0], end=test_indices[-1], exog=exog_test_df)
+forecasted_variance = garch_forecast.variance.values[-1]
+forecasted_stddev = np.sqrt(forecasted_variance) / scaling_factor
 
-final_preds = mean_forecast_test.values
-final_rmse = np.sqrt(mean_squared_error(test_diff, final_preds))
+rs = np.random.RandomState(42)
+nu = garch_fitted.params.get('nu', 4.0)
+dist = best_params_vol['dist']
 
-#PLOT THE FORECASTS
-plt.figure(figsize=(12, 6))
-plt.plot(test_dates, test_diff, label='Actual Volume (Log Diff)', color='black', alpha=0.3, linewidth=1)
-plt.plot(test_dates, final_preds, label='Predicted (ARIMAX Mean)', color='crimson', linewidth=1.5)
-plt.title("Test Forecast: ARMAX Model")
-plt.xlabel("Date")
-plt.ylabel("Log Difference of Volume")
-plt.legend(loc='upper left')
-plt.grid(True, linestyle='--', alpha=0.4)
-plt.xticks(rotation=45)
-plt.tight_layout()
-plt.show()
+if dist == "normal":
+    simulated_z = rs.normal(0, 1, size=forecast_horizon)
+elif dist == "t":
+    simulated_z = rs.standard_t(df=nu, size=forecast_horizon)
+elif dist == "ged":
+    from scipy.stats import gennorm
+    simulated_z = gennorm.rvs(beta=nu, size=forecast_horizon, random_state=rs)
+
+predicted_et = forecasted_stddev * simulated_z
+combined_predictions = mean_forecast + predicted_et
+
+final_rmse = np.sqrt(mean_squared_error(test_diff, combined_predictions))
+mean_only_rmse = np.sqrt(mean_squared_error(test_diff, mean_forecast))
+
+#PLOT THE RESULTS
+fig = make_subplots(
+    rows=2, cols=1, 
+    subplot_titles=(
+        f"ARIMAX Point Forecast (RMSE: {mean_only_rmse:.6f})", 
+        f"Combined {best_params_vol['type']} Simulation (RMSE: {final_rmse:.6f})"
+    ),
+    vertical_spacing=0.12
+)
+
+fig.add_trace(
+    go.Scatter(x=test_dates, y=test_diff, name="Actual", 
+               line=dict(color='black', width=1), opacity=0.8),
+    row=1, col=1
+)
+fig.add_trace(
+    go.Scatter(x=test_dates, y=mean_forecast, name="Prediction", 
+               line=dict(color='blue', width=1.5)),
+    row=1, col=1
+)
+
+fig.add_trace(
+    go.Scatter(x=test_dates, y=test_diff, name="Actual", 
+               line=dict(color='black', width=1), opacity=0.8, showlegend=False),
+    row=2, col=1
+)
+
+fig.add_trace(
+    go.Scatter(x=test_dates, y=combined_predictions, name="Prediction (Combined)", 
+               line=dict(color='blue', width=1.5), showlegend=False),
+    row=2, col=1
+)
+
+fig.update_layout(
+    template="plotly_white",
+    height=900,
+    showlegend=True,
+    legend=dict(
+        orientation="v",
+        yanchor="top",
+        y=1,
+        xanchor="right",
+        x=1
+    ),
+    margin=dict(l=50, r=50, t=80, b=50)
+)
+
+fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='#f0f2f6', tickformat='%b %d %Y')
+fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='#f0f2f6', zeroline=True, zerolinecolor='lightgrey')
+fig.show()
 
 #PRINT RESULTS
-print("\n[FINAL MODEL PERFORMANCE]")
-print(f"ARMAX Model: ARIMAX(1,0,2) with {best_var}")
-print(f"GARCH Model: {best_params_vol['type']}({best_params_vol['order'][0]},{best_params_vol['order'][1]})")
-print(f"Distribution: {best_params_vol['dist']}")
-print(f"Final Test RMSE: {final_rmse:.6f}")
+print(f"\n[FINAL PERFORMANCE COMPARISON]")
+print(f"Mean-Only RMSE (Point Accuracy):     {mean_only_rmse:.6f}")
+print(f"Combined RMSE (Stochastic Realism):  {final_rmse:.6f}")
